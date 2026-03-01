@@ -1,0 +1,196 @@
+{
+  "identity": {
+    "name": "E1",
+    "persona": "The Anti-AI Designer",
+    "mission": "Create a digital workspace that feels like a physical intellectual studio. Reject the sterile 'SaaS Blue' aesthetic. Embrace the tactile warmth of paper, the precision of Swiss design, and the clarity of academic thought.",
+    "principles": [
+      "Fusion: Digital precision meets Physical warmth (Paper & Ink)",
+      "Emotion: Focus, Clarity, Achievement",
+      "Content: Documents are the heroes; UI is the frame",
+      "Negative Space: Give thoughts room to breathe"
+    ]
+  },
+  "typography": {
+    "instructions": "Import these fonts from Google Fonts. Do NOT use default system fonts for headings.",
+    "families": {
+      "headings": {
+        "name": "Newsreader",
+        "url": "https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,200..800;1,6..72,200..800&display=swap",
+        "class": "font-serif",
+        "usage": "All headings (h1-h6), Hero text, 'Big Numbers' in stats."
+      },
+      "body": {
+        "name": "Public Sans",
+        "url": "https://fonts.googleapis.com/css2?family=Public+Sans:ital,wght@0,100..900;1,100..900&display=swap",
+        "class": "font-sans",
+        "usage": "UI elements, navigation, document lists, dense text."
+      },
+      "mono": {
+        "name": "JetBrains Mono",
+        "url": "https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap",
+        "class": "font-mono",
+        "usage": "Citations, IDs, Code snippets, AI emergent keys."
+      }
+    },
+    "rules": {
+      "headings": "Tracking-tight (-0.02em). Italicize emphasized words for editorial feel.",
+      "overline": "Uppercase, tracking-widest (0.2em), text-xs, font-medium.",
+      "body": "Relaxed leading (1.6) for reading comfort."
+    }
+  },
+  "colors": {
+    "theme": "The Swiss Scholar",
+    "description": "A high-contrast, paper-inspired palette. Replaces 'sterile white' with 'warm paper' and 'pure black' with 'rich ink'.",
+    "palette": {
+      "light": {
+        "background": "#FAFAF9",
+        "foreground": "#1C1917",
+        "card": "#FFFFFF",
+        "card_foreground": "#1C1917",
+        "popover": "#FFFFFF",
+        "popover_foreground": "#1C1917",
+        "primary": "#1C1917",
+        "primary_foreground": "#FAFAF9",
+        "secondary": "#E7E5E4",
+        "secondary_foreground": "#1C1917",
+        "muted": "#F5F5F4",
+        "muted_foreground": "#78716C",
+        "accent": "#F5F5F4",
+        "accent_foreground": "#1C1917",
+        "destructive": "#EF4444",
+        "destructive_foreground": "#FAFAF9",
+        "border": "#E7E5E4",
+        "input": "#E7E5E4",
+        "ring": "#1C1917"
+      },
+      "dark": {
+        "background": "#0C0A09",
+        "foreground": "#FAFAF9",
+        "card": "#1C1917",
+        "card_foreground": "#FAFAF9",
+        "popover": "#1C1917",
+        "popover_foreground": "#FAFAF9",
+        "primary": "#FAFAF9",
+        "primary_foreground": "#1C1917",
+        "secondary": "#292524",
+        "secondary_foreground": "#FAFAF9",
+        "muted": "#292524",
+        "muted_foreground": "#A8A29E",
+        "accent": "#292524",
+        "accent_foreground": "#FAFAF9",
+        "destructive": "#7F1D1D",
+        "destructive_foreground": "#FAFAF9",
+        "border": "#292524",
+        "input": "#292524",
+        "ring": "#FAFAF9"
+      }
+    },
+    "chart_colors": {
+      "academic": "#57534E",
+      "finance": "#10B981",
+      "legal": "#3B82F6",
+      "personal": "#F59E0B"
+    }
+  },
+  "visual_enhancers": {
+    "texture": {
+      "name": "Paper Noise",
+      "css": "background-image: url('https://grainy-gradients.vercel.app/noise.svg'); opacity: 0.03;",
+      "usage": "Apply to the main app container background to break digital sterility."
+    },
+    "shadows": {
+      "card": "0 1px 3px rgba(0,0,0,0.05), 0 1px 2px rgba(0,0,0,0.1)",
+      "hover": "0 10px 15px -3px rgba(0,0,0,0.05), 0 4px 6px -2px rgba(0,0,0,0.025)"
+    },
+    "borders": {
+      "style": "1px solid",
+      "color": "var(--border)",
+      "radius": "0px"
+    }
+  },
+  "components": {
+    "button": {
+      "style": "Sharp edges (rounded-none) or slightly rounded (rounded-sm).",
+      "hover": "Translate Y -1px, shadow-md. Invert colors on hover for primary buttons."
+    },
+    "card": {
+      "style": "Flat, 1px border. No massive shadows unless hovering. 'Physical Card' metaphor.",
+      "padding": "p-6 or p-8. Generous internal spacing."
+    },
+    "input": {
+      "style": "Minimalist. Background-transparent with bottom border ONLY (for 'form' feel) or standard solid background with sharp edges (for 'tool' feel).",
+      "focus": "Ring-1 ring-offset-2 ring-primary."
+    },
+    "badge": {
+      "style": "Pill shape (rounded-full). Low contrast background, high contrast text.",
+      "usage": "Category tags, Status indicators."
+    }
+  },
+  "layouts": {
+    "dashboard": {
+      "type": "Bento Grid",
+      "specs": "grid-cols-1 md:grid-cols-4 lg:grid-cols-12 gap-6",
+      "zones": {
+        "hero": "col-span-full lg:col-span-8 row-span-2 (Recent Activity / Upload)",
+        "stats": "col-span-1 md:col-span-2 lg:col-span-4 (Category Breakdown)",
+        "quick_list": "col-span-1 md:col-span-2 lg:col-span-4 (Recent Files)"
+      }
+    },
+    "library": {
+      "type": "Split Pane (Master-Detail)",
+      "specs": "Sidebar (Filters) 250px | Main Content (Grid/List) | Detail Panel (Slide-over)",
+      "interaction": "Clicking a row opens Detail Panel on the right (overlay or push)."
+    },
+    "paper_builder": {
+      "type": "Two-Column Focus",
+      "specs": "Left: PDF Viewer (50-60%), Right: Notes/AI Chat (40-50%)",
+      "mobile": "Tabs to switch between PDF and Notes."
+    }
+  },
+  "motion": {
+    "philosophy": "Micro-interactions only. No sweeping transitions that distract from reading.",
+    "definitions": {
+      "page_transition": "opacity-0 to opacity-100 duration-300 ease-in-out",
+      "card_hover": "transition-all duration-200 ease-out hover:-translate-y-1",
+      "modal_enter": "scale-95 opacity-0 to scale-100 opacity-100 duration-200"
+    }
+  },
+  "images": {
+    "landing_hero": {
+      "url": "https://images.unsplash.com/photo-1758315417320-a8bbed64d29b",
+      "description": "Bright, minimalist workspace. Use as Hero image or background for login.",
+      "usage": "Cover image with overlay for Login/Signup."
+    },
+    "empty_state_library": {
+      "url": "https://images.unsplash.com/photo-1736979110875-6f8e8bfdeb26",
+      "description": "Black and white pencil. Creative and minimal.",
+      "usage": "Empty state for 'My Writings' or 'Drafts'."
+    },
+    "empty_state_upload": {
+      "url": "https://images.unsplash.com/photo-1761481755390-83999d790b95",
+      "description": "Abstract flowing white shapes.",
+      "usage": "Background for Drag & Drop Upload zone (low opacity)."
+    },
+    "textures": {
+      "paper": "https://images.unsplash.com/photo-1736979110931-ac9c6fa82dbd",
+      "crumpled": "https://images.pexels.com/photos/28380286/pexels-photo-28380286.jpeg",
+      "usage": "Subtle textures for 'Paper Builder' mode backgrounds."
+    }
+  },
+  "universal_guidelines": [
+    "Do NOT use 'Inter' for Headings.",
+    "Do NOT use gradients for backgrounds. Use solid colors or subtle noise.",
+    "Ensure all interactive elements have `data-testid`.",
+    "Use `sonner` for toast notifications.",
+    "Use `lucide-react` for icons.",
+    "Maintain consistent padding: `p-6` or `p-8` for cards.",
+    "Dark mode should be 'Ink' (dark grey), not 'Void' (pure black)."
+  ],
+  "instructions_to_main_agent": [
+    "1. UPDATE `tailwind.config.js` with the 'Swiss Scholar' palette defined in `colors`.",
+    "2. UPDATE `index.css` to import Google Fonts (Newsreader, Public Sans).",
+    "3. CREATE a `Layout` component that implements the sidebar/header structure.",
+    "4. BUILD the Dashboard using the Bento Grid layout.",
+    "5. IMPLEMENT the 'Paper Builder' with a split-screen resizable layout."
+  ]
+}
