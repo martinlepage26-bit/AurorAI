@@ -1,77 +1,63 @@
-# DocSort - Document Organizer PRD
+# AurorAI — Intelligent Document Processing (IDP) PRD
 
-## Original Problem Statement
-Build a document sorter PWA that takes PDFs and documents, sorts them by categories with AI-powered auto-categorization. Features include drag & drop upload, AI categorization with manual override, Paper Builder for academic papers (reading lists, citation extraction, AI summaries).
+## Mission
+AurorAI transforme des documents “bloqués” (PDF, scans, formulaires, contrats, factures) en **données structurées, recherchables et exploitables**, avec **traçabilité**, **sécurité** et **conformité** pour les environnements réglementés.
 
-## Architecture
-- **Frontend**: React PWA with Shadcn UI components, Swiss Scholar design theme
-- **Backend**: FastAPI with MongoDB
-- **AI Integration**: Emergent LLM key with OpenAI GPT-4o-mini for categorization, summaries, citations
+## Positionnement
+- Passage de fichiers statiques vers information vivante (indexable, analysable, routable, auditable).
+- Réduction des erreurs opérationnelles et des risques de conformité.
+- Priorité aux secteurs à volume élevé et exigences de contrôle strictes: finance, santé, public, juridique, éducation.
 
-## User Personas
-1. **Researchers/Academics**: Organize papers, extract citations, build reading lists
-2. **Professionals**: Sort invoices, contracts, reports
-3. **Personal Users**: Manage personal documents, resumes
+## Pipeline canonique IDP
+1. Ingestion : upload / boîte mail / dépôt / API
+2. Lecture (OCR) : texte depuis scans, images, PDF
+3. Compréhension (NLP) : contexte, entités, relations
+4. Classification : catégorie + document_type
+5. Extraction : champs clés vers schéma JSON/CSV + score de confiance
+6. Contrôle (HITL) : validation humaine ciblée en cas de faible confiance
+7. Routage & intégration : ERP/CRM/DMS, workflows, alertes
+8. Gouvernance : journal d’audit, versioning, rétention, contrôle d’accès
 
-## Core Requirements
-- Document upload (PDF, DOC, DOCX, TXT)
-- AI-powered auto-categorization
-- Manual category override
-- Document library with search/filter
-- Paper Builder with reading lists
-- AI summaries and citation extraction
+## Comportement opérationnel (golden rules)
+- Toujours produire une sortie lisible par humain + une sortie machine (JSON).
+- Toujours inclure : type + catégorie, champs extraits, confidence globale/par champ, ambiguïtés/manquants/anomalies, prochaines actions.
+- Ton d’exécution : rapide, précis, orienté risque.
 
-## What's Been Implemented (Jan 2026)
-- [x] Dashboard with Quick Stats, Categories breakdown, Recent Documents
-- [x] Upload page with drag & drop, file validation, progress tracking
-- [x] **Bulk upload with parallel processing (batches of 3)**
-- [x] **Bulk upload stats panel (files count, done, processing, failed)**
-- [x] **Clear All button for bulk uploads**
-- [x] AI categorization on upload (GPT-4o-mini)
-- [x] **Bulk AI categorization endpoint**
-- [x] Document Library with search, category filter, list/grid views
-- [x] Document detail page with metadata, category editing
-- [x] Paper Builder with reading list CRUD
-- [x] AI summary generation for academic papers
-- [x] Citation extraction from documents
-- [x] PWA manifest for installability
-- [x] Swiss Scholar design theme (Newsreader + Public Sans fonts)
+## État d’implémentation (actuel)
+- [x] Upload documentaire (PDF, DOC, DOCX, TXT)
+- [x] Catégorisation IA
+- [x] Résumé IA
+- [x] Extraction de citations
+- [x] Bibliothèque documentaire + filtres
+- [x] Reading lists
 
-## Categories
-1. Academic Papers
-2. Invoices/Receipts
-3. Contracts
-4. Reports
-5. Personal Documents
-6. Resumes
-7. My Writings & Publications
-8. Uncategorized
+## Upgrades IDP intégrés
+### P0 (indispensable)
+- [x] Prompt de classification IDP avec sortie JSON stricte (category, document_type, confidence, rationale)
+- [x] Prompt de résumé opérationnel (purpose, key points, obligations/deadlines, risques)
+- [x] Extraction de champs structurés (`/documents/{id}/extract`) avec confidence/evidence
+- [x] Contrôles automatiques (manquants, incohérences, doublons, formats invalides)
+- [x] Signal `review_required` pour Human-in-the-loop
+- [x] Journal d’audit des actions IA (classification, summary, extraction)
 
-## API Endpoints
-- POST /api/documents/upload - Upload document
-- POST /api/documents/bulk-categorize - Bulk AI categorization
-- POST /api/documents/{id}/categorize - AI categorization
-- POST /api/documents/{id}/summary - Generate AI summary
-- POST /api/documents/{id}/citations - Extract citations
-- GET/PATCH/DELETE /api/documents/{id} - Document CRUD
-- GET/POST/DELETE /api/reading-lists - Reading list management
+### P1 (réglementé + entreprise)
+- [ ] Schémas dédiés par document_type (invoice, claim, contract, intake form, HR file)
+- [ ] RBAC fin + masquage PII
+- [ ] Versioning complet + politiques de rétention paramétrables
 
-## Prioritized Backlog
-### P0 (Critical)
-- None - core features complete
+### P2 (scalabilité)
+- [ ] Traitement asynchrone par queue
+- [ ] Traitement par lots avancé
+- [ ] Monitoring latence / taux d’erreur / qualité extraction
 
-### P1 (High Priority)
-- Document tags and custom categories
-- Export reading list to PDF/BibTeX
-- Folder upload support
+## API IDP (backend)
+- `GET /api/` : message + mission + pipeline IDP
+- `GET /api/idp/pipeline` : pipeline et règles d’or
+- `POST /api/documents/{id}/categorize` : classification IDP enrichie
+- `POST /api/documents/{id}/summary` : résumé opérationnel
+- `POST /api/documents/{id}/extract` : extraction structurée + contrôles + conformité + actions
+- `POST /api/documents/{id}/citations` : citations
 
-### P2 (Nice to Have)
-- Google Drive/Dropbox integration
-- Collaborative reading lists
-- Full-text search within documents
-- OCR for scanned documents
-
-## Next Tasks
-1. Implement document tagging system
-2. Add BibTeX export for citations
-3. Add folder upload support
+## Message marché
+- AurorAI automatise la lecture, la classification et l’extraction de données depuis vos documents.
+- Elle accélère les workflows, améliore l’exactitude et renforce la conformité via audit, contrôle et validation ciblée.
