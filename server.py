@@ -7,7 +7,7 @@ import os
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 from datetime import datetime, timezone
 import fitz  # PyMuPDF
@@ -46,6 +46,22 @@ CATEGORIES = [
     "Uncategorized"
 ]
 
+IDP_MISSION = (
+    "AurorAI transforme des documents bloqués en données structurées, "
+    "recherchables et exploitables, avec traçabilité, sécurité et conformité."
+)
+
+IDP_PIPELINE = [
+    "Ingestion: upload / email / dépôt / API",
+    "Lecture (OCR): extraction de texte depuis scans, images, PDF",
+    "Compréhension (NLP): contexte, entités, relations",
+    "Classification: type de document + sous-type",
+    "Extraction: champs clés vers un schéma JSON/CSV avec score de confiance",
+    "Contrôle (HITL): validation humaine ciblée sous seuil de confiance",
+    "Routage & intégration: ERP/CRM/DMS, workflows et alertes",
+    "Gouvernance: audit trail, versioning, rétention et contrôle d'accès",
+]
+
 # Define Models
 class Document(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -54,6 +70,9 @@ class Document(BaseModel):
     original_filename: str
     category: str = "Uncategorized"
     ai_suggested_category: Optional[str] = None
+    document_type: Optional[str] = None
+    classification_confidence: Optional[float] = None
+    classification_rationale: Optional[str] = None
     file_size: int = 0
     page_count: int = 0
     text_preview: str = ""
@@ -61,6 +80,11 @@ class Document(BaseModel):
     is_academic: bool = False
     citations: List[str] = []
     summary: Optional[str] = None
+    extraction: Dict[str, Any] = Field(default_factory=dict)
+    control_checks: Dict[str, List[str]] = Field(default_factory=dict)
+    review_required: bool = False
+    compliance_note: Optional[str] = None
+    audit_log: List[Dict[str, Any]] = Field(default_factory=list)
     reading_list_id: Optional[str] = None
     tags: List[str] = []
 
@@ -103,6 +127,66 @@ class AISummaryRequest(BaseModel):
 class CitationExtractionRequest(BaseModel):
     document_id: str
 
+
+def append_audit_event(document: Dict[str, Any], action: str, details: Dict[str, Any]) -> List[Dict[str, Any]]:
+    events = document.get("audit_log", [])
+    events.append(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "details": details,
+        }
+    )
+    return events[-100:]
+
+
+def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+
+
+def run_control_checks(extraction_fields: Dict[str, Dict[str, Any]]) -> Dict[str, List[str]]:
+    missing = []
+    anomalies = []
+    invalid = []
+    duplicates = []
+
+    values_seen = {}
+    for field_name, field_data in extraction_fields.items():
+        value = str(field_data.get("value", "")).strip()
+        if not value:
+            missing.append(field_name)
+            continue
+
+        if value in values_seen:
+            duplicates.append(f"{field_name} duplicates {values_seen[value]}")
+        else:
+            values_seen[value] = field_name
+
+        lower_field = field_name.lower()
+        if "date" in lower_field and not re.search(r"\d{4}-\d{2}-\d{2}|\d{2}/\d{2}/\d{4}", value):
+            invalid.append(f"{field_name} has non-standard date format: {value}")
+        if any(token in lower_field for token in ["amount", "total", "price"]) and not re.search(r"\d", value):
+            invalid.append(f"{field_name} has no numeric value: {value}")
+        if "id" in lower_field or "number" in lower_field:
+            if len(value) < 4:
+                anomalies.append(f"{field_name} looks too short: {value}")
+
+    return {
+        "missing_fields": missing,
+        "inconsistencies": anomalies,
+        "duplicate_values": duplicates,
+        "invalid_values": invalid,
+    }
+
 # Helper function to extract text from PDF
 def extract_pdf_text(pdf_path: str, max_pages: int = 10) -> tuple[str, int]:
     """Extract text from PDF file"""
@@ -138,51 +222,82 @@ def extract_citations_from_text(text: str) -> List[str]:
     return list(set(citations))[:50]  # Return unique citations, max 50
 
 # AI Integration using Emergent
-async def ai_categorize_document(text: str) -> str:
-    """Use AI to categorize document based on content"""
+async def ai_categorize_document(text: str) -> Dict[str, Any]:
+    """Use AI to categorize document based on content."""
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
         
         api_key = os.environ.get('EMERGENT_LLM_KEY')
         if not api_key:
-            return "Uncategorized"
+            return {
+                "category": "Uncategorized",
+                "document_type": "unknown",
+                "confidence": 0.0,
+                "rationale": "No API key configured.",
+            }
         
         chat = LlmChat(
             api_key=api_key,
             session_id=str(uuid.uuid4()),
-            system_message="""You are a document categorization expert. Analyze the document text and categorize it into ONE of these categories:
-- Academic Papers (research papers, journal articles, scientific studies)
-- Invoices/Receipts (bills, payment records, financial documents)
-- Contracts (legal agreements, terms of service, contracts)
-- Reports (business reports, annual reports, analysis documents)
-- Personal Documents (IDs, certificates, personal letters)
-- Resumes (CVs, job applications, professional profiles)
-- My Writings & Publications (personal writings, drafts, publications)
-- Uncategorized (if none of the above fit)
+            system_message="""You are AurorAI, an Intelligent Document Processing (IDP) engine.
+Goal: turn documents into structured, actionable data with compliance-minded care.
 
-Respond with ONLY the category name, nothing else."""
+Task: classify the document into ONE category from the allowed list AND detect a more specific document_type.
+
+Return ONLY valid JSON with keys:
+- category (must match exactly one allowed category)
+- document_type (short string, e.g., "invoice", "employment_contract", "medical_intake_form", "loan_application", "court_filing")
+- confidence (0.0–1.0)
+- rationale (max 2 sentences)
+
+Allowed categories:
+Academic Papers; Invoices/Receipts; Contracts; Reports; Personal Documents; Resumes; My Writings & Publications; Uncategorized"""
         ).with_model("openai", "gpt-4o-mini")
         
         # Truncate text for API
         truncated_text = text[:3000] if len(text) > 3000 else text
         
-        user_message = UserMessage(text=f"Categorize this document:\n\n{truncated_text}")
+        user_message = UserMessage(text=f"Classify this document:\n\n{truncated_text}")
         response = await chat.send_message(user_message)
-        
-        # Validate response is a valid category
-        response_clean = response.strip()
-        if response_clean in CATEGORIES:
-            return response_clean
-        
-        # Try to match partial
+
+        payload = parse_json_response(response.strip()) or {}
+        category = payload.get("category", "Uncategorized")
+        document_type = payload.get("document_type", "unknown")
+        confidence = float(payload.get("confidence", 0.0) or 0.0)
+        confidence = max(0.0, min(1.0, confidence))
+        rationale = str(payload.get("rationale", "Model response could not be validated."))
+
+        if category in CATEGORIES:
+            return {
+                "category": category,
+                "document_type": document_type,
+                "confidence": confidence,
+                "rationale": rationale,
+            }
+
         for cat in CATEGORIES:
-            if cat.lower() in response_clean.lower():
-                return cat
-        
-        return "Uncategorized"
+            if cat.lower() in str(response).lower():
+                return {
+                    "category": cat,
+                    "document_type": document_type,
+                    "confidence": confidence,
+                    "rationale": rationale,
+                }
+
+        return {
+            "category": "Uncategorized",
+            "document_type": document_type,
+            "confidence": confidence,
+            "rationale": rationale,
+        }
     except Exception as e:
         logging.error(f"AI categorization error: {e}")
-        return "Uncategorized"
+        return {
+            "category": "Uncategorized",
+            "document_type": "unknown",
+            "confidence": 0.0,
+            "rationale": f"Categorization failed: {str(e)}",
+        }
 
 async def ai_generate_summary(text: str) -> str:
     """Use AI to generate document summary"""
@@ -196,12 +311,15 @@ async def ai_generate_summary(text: str) -> str:
         chat = LlmChat(
             api_key=api_key,
             session_id=str(uuid.uuid4()),
-            system_message="""You are an expert at summarizing documents. Provide a clear, concise summary of the document covering:
-1. Main topic/purpose
-2. Key points or findings
-3. Conclusions or recommendations (if applicable)
+            system_message="""You are AurorAI, an IDP assistant. Summarize for operational use.
 
-Keep the summary under 200 words."""
+Output format:
+- Purpose (1 sentence)
+- Key points (3–6 bullets)
+- Decisions / obligations / deadlines (bullets, if any)
+- Risks or missing info (bullets, if any)
+
+Keep it under 180 words. No fluff."""
         ).with_model("openai", "gpt-4o-mini")
         
         truncated_text = text[:5000] if len(text) > 5000 else text
@@ -213,6 +331,62 @@ Keep the summary under 200 words."""
     except Exception as e:
         logging.error(f"AI summary error: {e}")
         return f"Summary generation failed: {str(e)}"
+
+
+async def ai_extract_fields(text: str) -> Dict[str, Any]:
+    """Use AI to extract structured fields with confidence scores."""
+    try:
+        from emergentintegrations.llm.chat import LlmChat, UserMessage
+
+        api_key = os.environ.get('EMERGENT_LLM_KEY')
+        if not api_key:
+            return {
+                "document_type": "unknown",
+                "fields": {},
+                "missing_or_ambiguous": ["Extraction unavailable - API key missing"],
+                "recommended_next_actions": ["Configure EMERGENT_LLM_KEY"],
+            }
+
+        chat = LlmChat(
+            api_key=api_key,
+            session_id=str(uuid.uuid4()),
+            system_message="""You are AurorAI, an Intelligent Document Processing (IDP) extractor.
+
+Extract key fields as structured data. Return ONLY valid JSON:
+{
+  "document_type": "...",
+  "fields": {
+     "<field_name>": {"value": "...", "confidence": 0.0-1.0, "evidence": "short quote"}
+  },
+  "missing_or_ambiguous": ["..."],
+  "recommended_next_actions": ["..."]
+}
+
+Rules:
+- Prefer accuracy over completeness.
+- If a field is not present, do NOT guess; add it to missing_or_ambiguous.
+- Evidence must be a short snippet from the text (max ~12 words)."""
+        ).with_model("openai", "gpt-4o-mini")
+
+        truncated_text = text[:6000] if len(text) > 6000 else text
+        response = await chat.send_message(UserMessage(text=f"Extract fields from:\n\n{truncated_text}"))
+        parsed = parse_json_response(response.strip())
+        if not parsed:
+            return {
+                "document_type": "unknown",
+                "fields": {},
+                "missing_or_ambiguous": ["Model response could not be parsed as JSON"],
+                "recommended_next_actions": ["Run HITL validation"],
+            }
+        return parsed
+    except Exception as e:
+        logging.error(f"AI extraction error: {e}")
+        return {
+            "document_type": "unknown",
+            "fields": {},
+            "missing_or_ambiguous": [f"Extraction failed: {str(e)}"],
+            "recommended_next_actions": ["Run HITL validation"],
+        }
 
 async def ai_extract_citations(text: str) -> List[str]:
     """Use AI to extract and format citations"""
@@ -246,7 +420,24 @@ Return ONLY the citations, one per line, no numbering or bullets."""
 # Routes
 @api_router.get("/")
 async def root():
-    return {"message": "Document Sorter API"}
+    return {
+        "message": "AurorAI IDP API",
+        "mission": IDP_MISSION,
+        "pipeline": IDP_PIPELINE,
+    }
+
+
+@api_router.get("/idp/pipeline")
+async def get_idp_pipeline():
+    return {
+        "mission": IDP_MISSION,
+        "pipeline": IDP_PIPELINE,
+        "golden_rules": [
+            "Always return one human-readable output and one machine-readable output.",
+            "Always include confidence, ambiguity flags, and recommended next actions.",
+            "Focus on risk-aware processing for regulated sectors.",
+        ],
+    }
 
 @api_router.get("/categories")
 async def get_categories():
@@ -346,7 +537,8 @@ async def categorize_document(doc_id: str):
         raise HTTPException(status_code=400, detail="No text content to analyze")
     
     # AI categorization
-    suggested_category = await ai_categorize_document(text)
+    classification = await ai_categorize_document(text)
+    suggested_category = classification["category"]
     
     # Check if it's academic
     is_academic = suggested_category == "Academic Papers" or "My Writings" in suggested_category
@@ -357,13 +549,29 @@ async def categorize_document(doc_id: str):
         {"$set": {
             "ai_suggested_category": suggested_category,
             "category": suggested_category,
-            "is_academic": is_academic
+            "document_type": classification.get("document_type"),
+            "classification_confidence": classification.get("confidence"),
+            "classification_rationale": classification.get("rationale"),
+            "is_academic": is_academic,
+            "review_required": classification.get("confidence", 0.0) < 0.75,
+            "audit_log": append_audit_event(
+                doc,
+                "categorize",
+                {
+                    "category": suggested_category,
+                    "document_type": classification.get("document_type"),
+                    "confidence": classification.get("confidence"),
+                },
+            ),
         }}
     )
     
     return {
         "document_id": doc_id,
         "suggested_category": suggested_category,
+        "document_type": classification.get("document_type"),
+        "confidence": classification.get("confidence"),
+        "rationale": classification.get("rationale"),
         "is_academic": is_academic
     }
 
@@ -392,7 +600,8 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
                 results.append({"document_id": doc_id, "error": "No text content"})
                 continue
             
-            suggested_category = await ai_categorize_document(text)
+            classification = await ai_categorize_document(text)
+            suggested_category = classification["category"]
             is_academic = suggested_category == "Academic Papers" or "My Writings" in suggested_category
             
             await db.documents.update_one(
@@ -400,6 +609,9 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
                 {"$set": {
                     "ai_suggested_category": suggested_category,
                     "category": suggested_category,
+                    "document_type": classification.get("document_type"),
+                    "classification_confidence": classification.get("confidence"),
+                    "classification_rationale": classification.get("rationale"),
                     "is_academic": is_academic
                 }}
             )
@@ -407,6 +619,8 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
             results.append({
                 "document_id": doc_id,
                 "suggested_category": suggested_category,
+                "document_type": classification.get("document_type"),
+                "confidence": classification.get("confidence"),
                 "is_academic": is_academic
             })
         except Exception as e:
@@ -434,10 +648,75 @@ async def generate_summary(doc_id: str):
     
     await db.documents.update_one(
         {"id": doc_id},
-        {"$set": {"summary": summary}}
+        {
+            "$set": {
+                "summary": summary,
+                "audit_log": append_audit_event(doc, "summary", {"summary_length": len(summary)}),
+            }
+        }
     )
     
     return {"document_id": doc_id, "summary": summary}
+
+
+@api_router.post("/documents/{doc_id}/extract")
+async def extract_fields(doc_id: str):
+    """Extract machine-readable fields and control signals from a document."""
+    doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    text = doc.get('text_preview', '')
+    if not text:
+        file_path = UPLOAD_DIR / doc['filename']
+        if file_path.exists() and doc['filename'].endswith('.pdf'):
+            text, _ = extract_pdf_text(str(file_path), max_pages=50)
+
+    if not text:
+        raise HTTPException(status_code=400, detail="No text content to analyze")
+
+    extraction = await ai_extract_fields(text)
+    fields = extraction.get("fields", {}) if isinstance(extraction.get("fields"), dict) else {}
+    controls = run_control_checks(fields)
+    review_required = bool(controls["missing_fields"] or controls["invalid_values"])
+
+    compliance_note = (
+        "Contains potentially sensitive data; apply restricted access and masking where required."
+        if any(tag in text.lower() for tag in ["patient", "ssn", "iban", "account", "medical"]) else
+        "No obvious sensitive marker found; enforce standard retention and least-privilege access."
+    )
+
+    await db.documents.update_one(
+        {"id": doc_id},
+        {
+            "$set": {
+                "document_type": extraction.get("document_type") or doc.get("document_type"),
+                "extraction": extraction,
+                "control_checks": controls,
+                "review_required": review_required,
+                "compliance_note": compliance_note,
+                "audit_log": append_audit_event(
+                    doc,
+                    "extract",
+                    {
+                        "field_count": len(fields),
+                        "missing_count": len(controls["missing_fields"]),
+                        "invalid_count": len(controls["invalid_values"]),
+                    },
+                ),
+            }
+        },
+    )
+
+    return {
+        "document_id": doc_id,
+        "document_type": extraction.get("document_type"),
+        "data": extraction,
+        "controls": controls,
+        "compliance_note": compliance_note,
+        "recommended_next_actions": extraction.get("recommended_next_actions", []),
+        "review_required": review_required,
+    }
 
 @api_router.post("/documents/{doc_id}/citations")
 async def extract_citations(doc_id: str):
