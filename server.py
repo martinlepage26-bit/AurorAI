@@ -335,6 +335,12 @@ Keep it under 180 words. No fluff."""
 
 async def ai_extract_fields(text: str) -> Dict[str, Any]:
     """Use AI to extract structured fields with confidence scores."""
+    default_payload = {
+        "document_type": "unknown",
+        "fields": {},
+        "missing_or_ambiguous": ["Model response could not be parsed as valid object JSON"],
+        "recommended_next_actions": ["Run HITL validation"],
+    }
     try:
         from emergentintegrations.llm.chat import LlmChat, UserMessage
 
@@ -371,13 +377,8 @@ Rules:
         truncated_text = text[:6000] if len(text) > 6000 else text
         response = await chat.send_message(UserMessage(text=f"Extract fields from:\n\n{truncated_text}"))
         parsed = parse_json_response(response.strip())
-        if not parsed:
-            return {
-                "document_type": "unknown",
-                "fields": {},
-                "missing_or_ambiguous": ["Model response could not be parsed as JSON"],
-                "recommended_next_actions": ["Run HITL validation"],
-            }
+        if not parsed or not isinstance(parsed, dict):
+            return default_payload
         return parsed
     except Exception as e:
         logging.error(f"AI extraction error: {e}")
@@ -678,7 +679,8 @@ async def extract_fields(doc_id: str):
     extraction = await ai_extract_fields(text)
     fields = extraction.get("fields", {}) if isinstance(extraction.get("fields"), dict) else {}
     controls = run_control_checks(fields)
-    review_required = bool(controls["missing_fields"] or controls["invalid_values"])
+    extraction_review_required = bool(controls["missing_fields"] or controls["invalid_values"])
+    review_required = bool(doc.get("review_required") or extraction_review_required)
 
     compliance_note = (
         "Contains potentially sensitive data; apply restricted access and masking where required."
