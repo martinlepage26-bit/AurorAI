@@ -1,10 +1,13 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Form, Depends
 from fastapi.responses import FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
+import hashlib
+import asyncio
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import Any, Dict, List, Optional
@@ -15,6 +18,8 @@ import aiofiles
 import tempfile
 import json
 import re
+from urllib import request as urllib_request
+from urllib.error import HTTPError, URLError
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -33,6 +38,10 @@ app = FastAPI()
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
+security = HTTPBearer(auto_error=False)
+AURORAI_API_TOKEN = os.environ.get("AURORAI_API_TOKEN", "")
+COMPASSAI_BASE_URL = os.environ.get("COMPASSAI_BASE_URL", "http://127.0.0.1:9205").rstrip("/")
+COMPASSAI_INGEST_TOKEN = os.environ.get("COMPASSAI_INGEST_TOKEN", "")
 
 # Categories
 CATEGORIES = [
@@ -84,6 +93,7 @@ class Document(BaseModel):
     control_checks: Dict[str, List[str]] = Field(default_factory=dict)
     review_required: bool = False
     compliance_note: Optional[str] = None
+    source_hash: Optional[str] = None
     audit_log: List[Dict[str, Any]] = Field(default_factory=list)
     reading_list_id: Optional[str] = None
     tags: List[str] = []
@@ -126,6 +136,32 @@ class AISummaryRequest(BaseModel):
 
 class CitationExtractionRequest(BaseModel):
     document_id: str
+
+
+class EvidencePackageRequest(BaseModel):
+    usecase_id: str
+    producer: str = "aurorai"
+    artifact_type: str = "evidence_package"
+
+
+class EvidenceHandoffRequest(EvidencePackageRequest):
+    compassai_base_url: Optional[str] = None
+
+
+async def require_api_token(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    """Protect sensitive document routes until shared auth is introduced."""
+    if not AURORAI_API_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="AURORAI_API_TOKEN is not configured on the server.",
+        )
+
+    if not credentials or credentials.credentials != AURORAI_API_TOKEN:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    return True
 
 
 def append_audit_event(document: Dict[str, Any], action: str, details: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -187,6 +223,326 @@ def run_control_checks(extraction_fields: Dict[str, Dict[str, Any]]) -> Dict[str
         "invalid_values": invalid,
     }
 
+
+def compute_sha256_bytes(data: bytes) -> str:
+    return f"sha256:{hashlib.sha256(data).hexdigest()}"
+
+
+def compute_sha256_json(data: Any) -> str:
+    canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return compute_sha256_bytes(canonical)
+
+
+def detect_pii_markers(text: str) -> List[str]:
+    markers = []
+    pii_patterns = {
+        "ssn": r"\b\d{3}-\d{2}-\d{4}\b",
+        "credit_card": r"\b(?:\d[ -]?){13,16}\b",
+        "email": r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
+        "phone": r"\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b",
+        "iban": r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b",
+    }
+
+    for label, pattern in pii_patterns.items():
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            markers.append(label)
+
+    lowered = text.lower()
+    keyword_markers = {
+        "financial_context": ["account number", "routing number", "wire transfer"],
+        "medical_context": ["patient", "diagnosis", "medical record", "health card"],
+    }
+    for label, keywords in keyword_markers.items():
+        if any(keyword in lowered for keyword in keywords):
+            markers.append(label)
+
+    return sorted(set(markers))
+
+
+def get_below_threshold_fields(
+    extraction_fields: Dict[str, Dict[str, Any]],
+    threshold: float = 0.85,
+) -> List[Dict[str, Any]]:
+    below_threshold = []
+    for field_name, field_data in extraction_fields.items():
+        confidence = field_data.get("confidence")
+        if isinstance(confidence, (int, float)) and float(confidence) < threshold:
+            below_threshold.append(
+                {
+                    "field": field_name,
+                    "confidence": round(float(confidence), 4),
+                    "threshold": threshold,
+                }
+            )
+    return below_threshold
+
+
+def detect_high_value_transaction(extraction_fields: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for field_name, field_data in extraction_fields.items():
+        if not any(token in field_name.lower() for token in ["amount", "total", "price", "payment"]):
+            continue
+
+        raw_value = str(field_data.get("value", "")).strip()
+        normalized = re.sub(r"[^0-9.,-]", "", raw_value).replace(",", "")
+        if not normalized:
+            continue
+
+        try:
+            amount = float(normalized)
+        except ValueError:
+            continue
+
+        if amount >= 10000:
+            return {
+                "field": field_name,
+                "amount": amount,
+            }
+
+    return None
+
+
+def build_hitl_reason(
+    below_threshold_fields: List[Dict[str, Any]],
+    pii_markers: List[str],
+    high_value_trigger: Optional[Dict[str, Any]],
+) -> Optional[str]:
+    reasons = []
+    if below_threshold_fields:
+        reasons.append("confidence_below_threshold")
+    if pii_markers:
+        reasons.append("pii_detected")
+    if high_value_trigger:
+        reasons.append("high_value_transaction")
+    return ", ".join(reasons) if reasons else None
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def build_evidence_package(document: Dict[str, Any], request: EvidencePackageRequest) -> Dict[str, Any]:
+    extraction = document.get("extraction", {}) or {}
+    fields = extraction.get("fields", {}) if isinstance(extraction.get("fields"), dict) else {}
+    controls = document.get("control_checks", {}) or {}
+
+    below_threshold_fields = get_below_threshold_fields(fields)
+    pii_markers = detect_pii_markers(document.get("text_preview", ""))
+    high_value_trigger = detect_high_value_transaction(fields)
+    mandatory_fields_present = not bool(controls.get("missing_fields"))
+    hitl_trigger_reason = build_hitl_reason(below_threshold_fields, pii_markers, high_value_trigger)
+    hitl_triggered = bool(document.get("review_required") or hitl_trigger_reason)
+    validation_status = (
+        "awaiting_hitl"
+        if hitl_triggered
+        else "auto_approved"
+        if mandatory_fields_present and not controls.get("invalid_values")
+        else "needs_review"
+    )
+
+    payload = {
+        "evidence_package": {
+            "extraction_id": f"EXT-{datetime.now(timezone.utc).year}-{document['id'][:8].upper()}",
+            "schema_version": "2026-03-01",
+            "document_metadata": {
+                "source_hash": document.get("source_hash"),
+                "document_type": extraction.get("document_type") or document.get("document_type") or "unknown",
+                "processing_timestamp": iso_now(),
+                "original_filename": document.get("original_filename"),
+            },
+            "extraction_results": {
+                "fields": fields,
+                "mandatory_fields_present": mandatory_fields_present,
+                "below_threshold_fields": below_threshold_fields,
+            },
+            "quality_controls": {
+                "pii_detected": pii_markers,
+                "pii_masking_applied": False,
+                "hitl_triggered": hitl_triggered,
+                "hitl_trigger_reason": hitl_trigger_reason,
+                "confidence_check": "passed" if not below_threshold_fields else "failed",
+                "validation_status": validation_status,
+            },
+            "metrics": {
+                "processing_time_ms": None,
+                "model_version": os.environ.get("AURORAI_MODEL_VERSION", "aurorai-preview"),
+                "accuracy_score_benchmark": None,
+                "benchmark_dataset": None,
+                "benchmark_date": None,
+            },
+            "audit_trail": {
+                "processor_id": os.environ.get("AURORAI_PROCESSOR_ID", "aurorai-api"),
+                "validation_chain": [event.get("action") for event in document.get("audit_log", []) if event.get("action")],
+                "approver": None,
+                "override_applied": False,
+            },
+            "if_trace_receipt": None,
+            "if_trace_binding_note": (
+                "if.trace binding is available via operator-initiated receipt generation; "
+                "not automatic on every package in the current implementation"
+            ),
+        }
+    }
+
+    envelope_control_checks = {
+        "missing_fields": controls.get("missing_fields", []),
+        "invalid_values": controls.get("invalid_values", []),
+        "duplicate_values": controls.get("duplicate_values", []),
+        "inconsistencies": controls.get("inconsistencies", []),
+        "review_required": hitl_triggered,
+        "pii_detected": pii_markers,
+        "high_value_trigger": high_value_trigger,
+    }
+
+    return {
+        "usecase_id": request.usecase_id,
+        "producer": request.producer,
+        "artifact_type": request.artifact_type,
+        "payload": payload,
+        "hash": compute_sha256_json(payload),
+        "control_checks": envelope_control_checks,
+    }
+
+
+def heuristic_document_type(text: str) -> str:
+    lowered = text.lower()
+    if "invoice" in lowered or "total amount" in lowered:
+        return "invoice"
+    if "agreement" in lowered or "contract" in lowered:
+        return "contract"
+    if "resume" in lowered or "curriculum vitae" in lowered:
+        return "resume"
+    if "report" in lowered:
+        return "report"
+    return "text_document"
+
+
+def heuristic_extract_fields(text: str) -> Dict[str, Any]:
+    field_patterns = [
+        ("invoice_number", r"(?:invoice(?: number| no\.?| #)?)[\s:.-]*([A-Z0-9-]+)", 0.72),
+        ("total_amount", r"(?:total(?: amount)?|amount due)[\s:.-]*([$]?\d[\d,]*(?:\.\d{2})?)", 0.72),
+        ("vendor_name", r"(?:vendor|supplier|from)[\s:.-]*([^\n]+)", 0.68),
+        ("document_date", r"(?:date)[\s:.-]*([0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{2}/[0-9]{2}/[0-9]{4}|[A-Z][a-z]{2,8}\s+\d{1,2},\s+\d{4})", 0.66),
+        ("contact_email", r"([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})", 0.7),
+        ("contact_phone", r"((?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4})", 0.67),
+    ]
+
+    fields: Dict[str, Dict[str, Any]] = {}
+    for field_name, pattern, confidence in field_patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip()
+        evidence_snippet = match.group(0).strip()[:120]
+        fields[field_name] = {
+            "value": value,
+            "confidence": confidence,
+            "evidence": evidence_snippet,
+        }
+
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    if first_line and "document_title" not in fields:
+        fields["document_title"] = {
+            "value": first_line[:120],
+            "confidence": 0.58,
+            "evidence": first_line[:120],
+        }
+
+    return {
+        "document_type": heuristic_document_type(text),
+        "fields": fields,
+        "missing_or_ambiguous": [] if fields else ["No structured fields were identified heuristically"],
+        "recommended_next_actions": (
+            ["Run HITL validation", "Configure EMERGENT_LLM_KEY for richer extraction"]
+            if fields
+            else ["Run HITL validation", "Provide a more structured source document"]
+        ),
+    }
+
+
+async def post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+    data = json.dumps(payload).encode("utf-8")
+
+    def _send() -> Dict[str, Any]:
+        req = urllib_request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json", **headers},
+            method="POST",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=20) as response:
+                raw_body = response.read().decode("utf-8")
+                return {
+                    "status_code": response.getcode(),
+                    "body": json.loads(raw_body) if raw_body else None,
+                }
+        except HTTPError as exc:
+            raw_body = exc.read().decode("utf-8")
+            return {
+                "status_code": exc.code,
+                "body": json.loads(raw_body) if raw_body else None,
+            }
+        except URLError as exc:
+            raise HTTPException(status_code=502, detail=f"CompassAI handoff failed: {exc.reason}") from exc
+
+    return await asyncio.to_thread(_send)
+
+
+async def create_evidence_record(doc_id: str, request: EvidencePackageRequest) -> Dict[str, Any]:
+    doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    extraction = doc.get("extraction", {}) or {}
+    fields = extraction.get("fields", {}) if isinstance(extraction.get("fields"), dict) else {}
+    if not fields:
+        raise HTTPException(
+            status_code=400,
+            detail="Structured extraction is required before an evidence package can be generated.",
+        )
+
+    if not doc.get("source_hash"):
+        file_path = UPLOAD_DIR / doc["filename"]
+        if file_path.exists():
+            with open(file_path, "rb") as handle:
+                source_hash = compute_sha256_bytes(handle.read())
+            doc["source_hash"] = source_hash
+            await db.documents.update_one({"id": doc_id}, {"$set": {"source_hash": source_hash}})
+        else:
+            raise HTTPException(status_code=400, detail="Source hash is missing and the source file is no longer available.")
+
+    evidence_envelope = build_evidence_package(doc, request)
+    version = await db.evidence_packages.count_documents(
+        {"document_id": doc_id, "usecase_id": request.usecase_id}
+    ) + 1
+    evidence_id = str(uuid.uuid4())
+    created_at = iso_now()
+
+    evidence_record = {
+        "id": evidence_id,
+        "document_id": doc_id,
+        "version": version,
+        "created_at": created_at,
+        **evidence_envelope,
+    }
+
+    await db.evidence_packages.insert_one(dict(evidence_record))
+    updated_audit_log = append_audit_event(
+        doc,
+        "evidence_package",
+        {
+            "evidence_id": evidence_id,
+            "usecase_id": request.usecase_id,
+            "version": version,
+        },
+    )
+    await db.documents.update_one(
+        {"id": doc_id},
+        {"$set": {"audit_log": updated_audit_log}},
+    )
+    evidence_record["document_audit_log"] = updated_audit_log
+    return evidence_record
+
 # Helper function to extract text from PDF
 def extract_pdf_text(pdf_path: str, max_pages: int = 10) -> tuple[str, int]:
     """Extract text from PDF file"""
@@ -222,24 +578,61 @@ def extract_citations_from_text(text: str) -> List[str]:
     return list(set(citations))[:50]  # Return unique citations, max 50
 
 # AI Integration using Emergent
+def get_llm_api_key() -> str:
+    return os.environ.get("OPENAI_API_KEY") or os.environ.get("EMERGENT_LLM_KEY") or ""
+
+
+def get_llm_base_url() -> Optional[str]:
+    return os.environ.get("OPENAI_BASE_URL") or None
+
+
+def infer_category_from_document_type(document_type: str) -> str:
+    mapping = {
+        "invoice": "Invoices/Receipts",
+        "contract": "Contracts",
+        "resume": "Resumes",
+        "report": "Reports",
+        "text_document": "Uncategorized",
+        "unknown": "Uncategorized",
+    }
+    return mapping.get((document_type or "unknown").lower(), "Uncategorized")
+
+
+async def run_llm_prompt(system_message: str, prompt: str, model: str = "gpt-4o-mini") -> str:
+    from emergentintegrations.llm.chat import LlmChat, SystemMessage, UserMessage
+
+    api_key = get_llm_api_key()
+    if not api_key:
+        raise RuntimeError("No OpenAI-compatible LLM key configured.")
+
+    chat = LlmChat(
+        model=model,
+        api_key=api_key,
+        base_url=get_llm_base_url(),
+    )
+    return await asyncio.to_thread(
+        chat.chat,
+        [
+            SystemMessage(content=system_message),
+            UserMessage(content=prompt),
+        ],
+    )
+
+
 async def ai_categorize_document(text: str) -> Dict[str, Any]:
     """Use AI to categorize document based on content."""
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
+        if not get_llm_api_key():
+            document_type = heuristic_document_type(text)
             return {
-                "category": "Uncategorized",
-                "document_type": "unknown",
-                "confidence": 0.0,
-                "rationale": "No API key configured.",
+                "category": infer_category_from_document_type(document_type),
+                "document_type": document_type,
+                "confidence": 0.42 if document_type != "unknown" else 0.0,
+                "rationale": "No LLM key configured. Heuristic categorization was used.",
             }
-        
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message="""You are AurorAI, an Intelligent Document Processing (IDP) engine.
+
+        response = await run_llm_prompt(
+            """You are AurorAI, an Intelligent Document Processing (IDP) engine.
 Goal: turn documents into structured, actionable data with compliance-minded care.
 
 Task: classify the document into ONE category from the allowed list AND detect a more specific document_type.
@@ -251,14 +644,9 @@ Return ONLY valid JSON with keys:
 - rationale (max 2 sentences)
 
 Allowed categories:
-Academic Papers; Invoices/Receipts; Contracts; Reports; Personal Documents; Resumes; My Writings & Publications; Uncategorized"""
-        ).with_model("openai", "gpt-4o-mini")
-        
-        # Truncate text for API
-        truncated_text = text[:3000] if len(text) > 3000 else text
-        
-        user_message = UserMessage(text=f"Classify this document:\n\n{truncated_text}")
-        response = await chat.send_message(user_message)
+Academic Papers; Invoices/Receipts; Contracts; Reports; Personal Documents; Resumes; My Writings & Publications; Uncategorized""",
+            f"Classify this document:\n\n{text[:3000] if len(text) > 3000 else text}",
+        )
 
         payload = parse_json_response(response.strip()) or {}
         category = payload.get("category", "Uncategorized")
@@ -285,33 +673,34 @@ Academic Papers; Invoices/Receipts; Contracts; Reports; Personal Documents; Resu
                 }
 
         return {
-            "category": "Uncategorized",
+            "category": infer_category_from_document_type(document_type),
             "document_type": document_type,
             "confidence": confidence,
             "rationale": rationale,
         }
     except Exception as e:
         logging.error(f"AI categorization error: {e}")
+        document_type = heuristic_document_type(text)
         return {
-            "category": "Uncategorized",
-            "document_type": "unknown",
-            "confidence": 0.0,
-            "rationale": f"Categorization failed: {str(e)}",
+            "category": infer_category_from_document_type(document_type),
+            "document_type": document_type,
+            "confidence": 0.35 if document_type != "unknown" else 0.0,
+            "rationale": f"LLM categorization unavailable. Heuristic fallback used: {str(e)}",
         }
+
 
 async def ai_generate_summary(text: str) -> str:
     """Use AI to generate document summary"""
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return "Summary not available - API key missing"
-        
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message="""You are AurorAI, an IDP assistant. Summarize for operational use.
+        if not get_llm_api_key():
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            preview = lines[:4]
+            if not preview:
+                return "Summary not available."
+            return "Purpose\n- Review uploaded document\n\nKey points\n- " + "\n- ".join(preview[:3])
+
+        response = await run_llm_prompt(
+            """You are AurorAI, an IDP assistant. Summarize for operational use.
 
 Output format:
 - Purpose (1 sentence)
@@ -319,38 +708,29 @@ Output format:
 - Decisions / obligations / deadlines (bullets, if any)
 - Risks or missing info (bullets, if any)
 
-Keep it under 180 words. No fluff."""
-        ).with_model("openai", "gpt-4o-mini")
-        
-        truncated_text = text[:5000] if len(text) > 5000 else text
-        
-        user_message = UserMessage(text=f"Summarize this document:\n\n{truncated_text}")
-        response = await chat.send_message(user_message)
-        
+Keep it under 180 words. No fluff.""",
+            f"Summarize this document:\n\n{text[:5000] if len(text) > 5000 else text}",
+        )
         return response.strip()
     except Exception as e:
         logging.error(f"AI summary error: {e}")
-        return f"Summary generation failed: {str(e)}"
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        preview = lines[:4]
+        if not preview:
+            return "Summary generation failed."
+        return "Purpose\n- Review uploaded document\n\nKey points\n- " + "\n- ".join(preview[:3])
 
 
 async def ai_extract_fields(text: str) -> Dict[str, Any]:
     """Use AI to extract structured fields with confidence scores."""
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
+        if not get_llm_api_key():
+            extracted = heuristic_extract_fields(text)
+            extracted["missing_or_ambiguous"] = extracted.get("missing_or_ambiguous", []) + ["LLM extraction unavailable - heuristic fallback used"]
+            return extracted
 
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
-            return {
-                "document_type": "unknown",
-                "fields": {},
-                "missing_or_ambiguous": ["Extraction unavailable - API key missing"],
-                "recommended_next_actions": ["Configure EMERGENT_LLM_KEY"],
-            }
-
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message="""You are AurorAI, an Intelligent Document Processing (IDP) extractor.
+        response = await run_llm_prompt(
+            """You are AurorAI, an Intelligent Document Processing (IDP) extractor.
 
 Extract key fields as structured data. Return ONLY valid JSON:
 {
@@ -365,54 +745,36 @@ Extract key fields as structured data. Return ONLY valid JSON:
 Rules:
 - Prefer accuracy over completeness.
 - If a field is not present, do NOT guess; add it to missing_or_ambiguous.
-- Evidence must be a short snippet from the text (max ~12 words)."""
-        ).with_model("openai", "gpt-4o-mini")
-
-        truncated_text = text[:6000] if len(text) > 6000 else text
-        response = await chat.send_message(UserMessage(text=f"Extract fields from:\n\n{truncated_text}"))
+- Evidence must be a short snippet from the text (max ~12 words).""",
+            f"Extract fields from:\n\n{text[:6000] if len(text) > 6000 else text}",
+        )
         parsed = parse_json_response(response.strip())
-        if not parsed:
-            return {
-                "document_type": "unknown",
-                "fields": {},
-                "missing_or_ambiguous": ["Model response could not be parsed as JSON"],
-                "recommended_next_actions": ["Run HITL validation"],
-            }
+        if not parsed or not parsed.get("fields"):
+            extracted = heuristic_extract_fields(text)
+            extracted["missing_or_ambiguous"] = extracted.get("missing_or_ambiguous", []) + ["LLM response was empty or invalid - heuristic fallback used"]
+            return extracted
         return parsed
     except Exception as e:
         logging.error(f"AI extraction error: {e}")
-        return {
-            "document_type": "unknown",
-            "fields": {},
-            "missing_or_ambiguous": [f"Extraction failed: {str(e)}"],
-            "recommended_next_actions": ["Run HITL validation"],
-        }
+        extracted = heuristic_extract_fields(text)
+        extracted["missing_or_ambiguous"] = extracted.get("missing_or_ambiguous", []) + [f"Extraction failed - heuristic fallback used: {str(e)}"]
+        return extracted
+
 
 async def ai_extract_citations(text: str) -> List[str]:
     """Use AI to extract and format citations"""
     try:
-        from emergentintegrations.llm.chat import LlmChat, UserMessage
-        
-        api_key = os.environ.get('EMERGENT_LLM_KEY')
-        if not api_key:
+        if not get_llm_api_key():
             return extract_citations_from_text(text)
-        
-        chat = LlmChat(
-            api_key=api_key,
-            session_id=str(uuid.uuid4()),
-            system_message="""You are a citation extraction expert. Extract all references and citations from the document text.
+
+        response = await run_llm_prompt(
+            """You are a citation extraction expert. Extract all references and citations from the document text.
 Format each citation on a new line. Include author names, year, and title when available.
-Return ONLY the citations, one per line, no numbering or bullets."""
-        ).with_model("openai", "gpt-4o-mini")
-        
-        truncated_text = text[:6000] if len(text) > 6000 else text
-        
-        user_message = UserMessage(text=f"Extract all citations from this document:\n\n{truncated_text}")
-        response = await chat.send_message(user_message)
-        
-        # Parse response into list
+Return ONLY the citations, one per line, no numbering or bullets.""",
+            f"Extract all citations from this document:\n\n{text[:6000] if len(text) > 6000 else text}",
+        )
         citations = [c.strip() for c in response.strip().split('\n') if c.strip()]
-        return citations[:50]  # Max 50 citations
+        return citations[:50]
     except Exception as e:
         logging.error(f"AI citation extraction error: {e}")
         return extract_citations_from_text(text)
@@ -474,11 +836,20 @@ async def get_stats():
     }
 
 @api_router.post("/documents/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """Upload a document (PDF, DOC, DOCX, TXT)"""
-    allowed_extensions = {'.pdf', '.doc', '.docx', '.txt'}
+async def upload_document(
+    file: UploadFile = File(...),
+    _auth: bool = Depends(require_api_token),
+):
+    """Upload a document (PDF or TXT)."""
+    allowed_extensions = {'.pdf', '.txt'}
     file_ext = Path(file.filename).suffix.lower()
-    
+
+    if file_ext in {'.doc', '.docx'}:
+        raise HTTPException(
+            status_code=400,
+            detail="DOC and DOCX upload is not enabled yet because text extraction is not implemented. Use PDF or TXT for now.",
+        )
+
     if file_ext not in allowed_extensions:
         raise HTTPException(status_code=400, detail=f"File type {file_ext} not supported. Allowed: {allowed_extensions}")
     
@@ -509,7 +880,8 @@ async def upload_document(file: UploadFile = File(...)):
         original_filename=file.filename,
         file_size=len(content),
         page_count=page_count,
-        text_preview=text_preview[:2000] if text_preview else ""
+        text_preview=text_preview[:2000] if text_preview else "",
+        source_hash=compute_sha256_bytes(content),
     )
     
     # Save to database
@@ -520,7 +892,10 @@ async def upload_document(file: UploadFile = File(...)):
     return doc.model_dump()
 
 @api_router.post("/documents/{doc_id}/categorize")
-async def categorize_document(doc_id: str):
+async def categorize_document(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Use AI to categorize a document"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -579,7 +954,10 @@ class BulkUploadRequest(BaseModel):
     document_ids: List[str]
 
 @api_router.post("/documents/bulk-categorize")
-async def bulk_categorize_documents(request: BulkUploadRequest):
+async def bulk_categorize_documents(
+    request: BulkUploadRequest,
+    _auth: bool = Depends(require_api_token),
+):
     """Bulk categorize multiple documents with AI"""
     results = []
     
@@ -603,6 +981,7 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
             classification = await ai_categorize_document(text)
             suggested_category = classification["category"]
             is_academic = suggested_category == "Academic Papers" or "My Writings" in suggested_category
+            review_required = classification.get("confidence", 0.0) < 0.75
             
             await db.documents.update_one(
                 {"id": doc_id},
@@ -612,7 +991,17 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
                     "document_type": classification.get("document_type"),
                     "classification_confidence": classification.get("confidence"),
                     "classification_rationale": classification.get("rationale"),
-                    "is_academic": is_academic
+                    "is_academic": is_academic,
+                    "review_required": review_required,
+                    "audit_log": append_audit_event(
+                        doc,
+                        "bulk_categorize",
+                        {
+                            "category": suggested_category,
+                            "document_type": classification.get("document_type"),
+                            "confidence": classification.get("confidence"),
+                        },
+                    ),
                 }}
             )
             
@@ -621,7 +1010,8 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
                 "suggested_category": suggested_category,
                 "document_type": classification.get("document_type"),
                 "confidence": classification.get("confidence"),
-                "is_academic": is_academic
+                "is_academic": is_academic,
+                "review_required": review_required,
             })
         except Exception as e:
             results.append({"document_id": doc_id, "error": str(e)})
@@ -629,7 +1019,10 @@ async def bulk_categorize_documents(request: BulkUploadRequest):
     return {"results": results}
 
 @api_router.post("/documents/{doc_id}/summary")
-async def generate_summary(doc_id: str):
+async def generate_summary(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Generate AI summary for a document"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -660,7 +1053,10 @@ async def generate_summary(doc_id: str):
 
 
 @api_router.post("/documents/{doc_id}/extract")
-async def extract_fields(doc_id: str):
+async def extract_fields(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Extract machine-readable fields and control signals from a document."""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -718,8 +1114,81 @@ async def extract_fields(doc_id: str):
         "review_required": review_required,
     }
 
+
+@api_router.post("/documents/{doc_id}/evidence-package")
+async def generate_evidence_package(
+    doc_id: str,
+    request: EvidencePackageRequest,
+    _auth: bool = Depends(require_api_token),
+):
+    """Build a spec-aligned evidence package for downstream governance ingestion."""
+    evidence_record = await create_evidence_record(doc_id, request)
+    evidence_record.pop("document_audit_log", None)
+    return evidence_record
+
+
+@api_router.post("/documents/{doc_id}/handoff-to-compassai")
+async def handoff_to_compassai(
+    doc_id: str,
+    request: EvidenceHandoffRequest,
+    _auth: bool = Depends(require_api_token),
+):
+    """Generate an evidence package and hand it off to CompassAI."""
+    if not COMPASSAI_INGEST_TOKEN:
+        raise HTTPException(status_code=503, detail="COMPASSAI_INGEST_TOKEN is not configured on the server.")
+
+    evidence_record = await create_evidence_record(doc_id, request)
+    evidence_record.pop("document_audit_log", None)
+
+    target_base_url = (request.compassai_base_url or COMPASSAI_BASE_URL).rstrip("/")
+    response = await post_json(
+        f"{target_base_url}/api/v1/evidence",
+        {
+            "usecase_id": evidence_record["usecase_id"],
+            "producer": evidence_record["producer"],
+            "artifact_type": evidence_record["artifact_type"],
+            "payload": evidence_record["payload"],
+            "hash": evidence_record["hash"],
+            "control_checks": evidence_record["control_checks"],
+        },
+        headers={"Authorization": f"Bearer {COMPASSAI_INGEST_TOKEN}"},
+    )
+
+    await db.evidence_handoffs.insert_one(
+        {
+            "id": str(uuid.uuid4()),
+            "document_id": doc_id,
+            "evidence_id": evidence_record["id"],
+            "usecase_id": request.usecase_id,
+            "target": "compassai",
+            "target_url": f"{target_base_url}/api/v1/evidence",
+            "status_code": response["status_code"],
+            "response": response["body"],
+            "created_at": iso_now(),
+        }
+    )
+
+    if response["status_code"] >= 400:
+        raise HTTPException(
+            status_code=response["status_code"],
+            detail={
+                "message": "CompassAI rejected the evidence handoff.",
+                "compassai_response": response["body"],
+                "evidence_id": evidence_record["id"],
+            },
+        )
+
+    return {
+        "message": "Evidence handed off to CompassAI.",
+        "evidence": evidence_record,
+        "compassai_response": response["body"],
+    }
+
 @api_router.post("/documents/{doc_id}/citations")
-async def extract_citations(doc_id: str):
+async def extract_citations(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Extract citations from a document"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -748,7 +1217,8 @@ async def get_documents(
     category: Optional[str] = None,
     search: Optional[str] = None,
     is_academic: Optional[bool] = None,
-    reading_list_id: Optional[str] = None
+    reading_list_id: Optional[str] = None,
+    _auth: bool = Depends(require_api_token),
 ):
     """Get all documents with optional filtering"""
     query = {}
@@ -775,7 +1245,10 @@ async def get_documents(
     return {"documents": docs}
 
 @api_router.get("/documents/{doc_id}")
-async def get_document(doc_id: str):
+async def get_document(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Get a single document"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -787,7 +1260,10 @@ async def get_document(doc_id: str):
     return doc
 
 @api_router.get("/documents/{doc_id}/download")
-async def download_document(doc_id: str):
+async def download_document(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Download a document file"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -804,7 +1280,11 @@ async def download_document(doc_id: str):
     )
 
 @api_router.patch("/documents/{doc_id}")
-async def update_document(doc_id: str, update: DocumentUpdate):
+async def update_document(
+    doc_id: str,
+    update: DocumentUpdate,
+    _auth: bool = Depends(require_api_token),
+):
     """Update document metadata"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -823,7 +1303,10 @@ async def update_document(doc_id: str, update: DocumentUpdate):
     return updated_doc
 
 @api_router.delete("/documents/{doc_id}")
-async def delete_document(doc_id: str):
+async def delete_document(
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Delete a document"""
     doc = await db.documents.find_one({"id": doc_id}, {"_id": 0})
     if not doc:
@@ -841,7 +1324,10 @@ async def delete_document(doc_id: str):
 
 # Reading Lists
 @api_router.post("/reading-lists")
-async def create_reading_list(data: ReadingListCreate):
+async def create_reading_list(
+    data: ReadingListCreate,
+    _auth: bool = Depends(require_api_token),
+):
     """Create a new reading list"""
     reading_list = ReadingList(
         name=data.name,
@@ -855,7 +1341,9 @@ async def create_reading_list(data: ReadingListCreate):
     return reading_list.model_dump()
 
 @api_router.get("/reading-lists")
-async def get_reading_lists():
+async def get_reading_lists(
+    _auth: bool = Depends(require_api_token),
+):
     """Get all reading lists"""
     lists = await db.reading_lists.find({}, {"_id": 0}).to_list(100)
     
@@ -867,7 +1355,10 @@ async def get_reading_lists():
     return {"reading_lists": lists}
 
 @api_router.get("/reading-lists/{list_id}")
-async def get_reading_list(list_id: str):
+async def get_reading_list(
+    list_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Get a reading list with its documents"""
     lst = await db.reading_lists.find_one({"id": list_id}, {"_id": 0})
     if not lst:
@@ -879,7 +1370,11 @@ async def get_reading_list(list_id: str):
     return lst
 
 @api_router.post("/reading-lists/{list_id}/documents/{doc_id}")
-async def add_to_reading_list(list_id: str, doc_id: str):
+async def add_to_reading_list(
+    list_id: str,
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Add a document to a reading list"""
     lst = await db.reading_lists.find_one({"id": list_id})
     if not lst:
@@ -897,7 +1392,11 @@ async def add_to_reading_list(list_id: str, doc_id: str):
     return {"message": "Document added to reading list"}
 
 @api_router.delete("/reading-lists/{list_id}/documents/{doc_id}")
-async def remove_from_reading_list(list_id: str, doc_id: str):
+async def remove_from_reading_list(
+    list_id: str,
+    doc_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Remove a document from a reading list"""
     await db.documents.update_one(
         {"id": doc_id, "reading_list_id": list_id},
@@ -907,7 +1406,10 @@ async def remove_from_reading_list(list_id: str, doc_id: str):
     return {"message": "Document removed from reading list"}
 
 @api_router.delete("/reading-lists/{list_id}")
-async def delete_reading_list(list_id: str):
+async def delete_reading_list(
+    list_id: str,
+    _auth: bool = Depends(require_api_token),
+):
     """Delete a reading list"""
     lst = await db.reading_lists.find_one({"id": list_id})
     if not lst:
