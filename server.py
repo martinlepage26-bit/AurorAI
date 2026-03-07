@@ -95,6 +95,15 @@ class Document(BaseModel):
     compliance_note: Optional[str] = None
     source_hash: Optional[str] = None
     audit_log: List[Dict[str, Any]] = Field(default_factory=list)
+    current_state: str = "uploaded"
+    current_review_state: str = "pending"
+    latest_run_id: Optional[str] = None
+    latest_package_id: Optional[str] = None
+    latest_handoff_id: Optional[str] = None
+    processing_runs: List[Dict[str, Any]] = Field(default_factory=list)
+    review_decisions: List[Dict[str, Any]] = Field(default_factory=list)
+    package_history: List[Dict[str, Any]] = Field(default_factory=list)
+    handoff_history: List[Dict[str, Any]] = Field(default_factory=list)
     reading_list_id: Optional[str] = None
     tags: List[str] = []
 
@@ -174,6 +183,108 @@ def append_audit_event(document: Dict[str, Any], action: str, details: Dict[str,
         }
     )
     return events[-100:]
+
+
+def latest_stage_run_id(document: Dict[str, Any], stage: str) -> Optional[str]:
+    for run in reversed(document.get("processing_runs", [])):
+        if run.get("stage") == stage:
+            return run.get("id")
+    return None
+
+
+def append_processing_run(
+    document: Dict[str, Any],
+    stage: str,
+    *,
+    triggered_by: str,
+    status: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    runs = list(document.get("processing_runs", []))
+    stage_runs = [run for run in runs if run.get("stage") == stage]
+    run_doc = {
+        "id": str(uuid.uuid4()),
+        "stage": stage,
+        "status": status,
+        "triggered_by": triggered_by,
+        "parent_run_id": latest_stage_run_id(document, stage),
+        "iteration_index": len(stage_runs) + 1,
+        "started_at": iso_now(),
+        "completed_at": iso_now(),
+        "details": details or {},
+    }
+    runs.append(run_doc)
+    return runs[-150:], run_doc
+
+
+def append_review_decision(
+    document: Dict[str, Any],
+    *,
+    run_id: Optional[str],
+    decision_type: str,
+    rationale: str,
+    resulting_state: str,
+    actor_type: str = "system",
+    actor_id: str = "aurorai",
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    decisions = list(document.get("review_decisions", []))
+    decision_doc = {
+        "id": str(uuid.uuid4()),
+        "run_id": run_id,
+        "parent_decision_id": decisions[-1]["id"] if decisions else None,
+        "review_round": len(decisions) + 1,
+        "actor_type": actor_type,
+        "actor_id": actor_id,
+        "decision_type": decision_type,
+        "rationale": rationale,
+        "resulting_state": resulting_state,
+        "created_at": iso_now(),
+    }
+    decisions.append(decision_doc)
+    return decisions[-150:], decision_doc
+
+
+def append_package_history(
+    document: Dict[str, Any],
+    *,
+    evidence_id: str,
+    version: int,
+    usecase_id: str,
+    package_hash: str,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    history = list(document.get("package_history", []))
+    package_doc = {
+        "id": evidence_id,
+        "version": version,
+        "usecase_id": usecase_id,
+        "hash": package_hash,
+        "created_at": iso_now(),
+        "supersedes_package_id": history[-1]["id"] if history else None,
+    }
+    history.append(package_doc)
+    return history[-100:], package_doc
+
+
+def append_handoff_history(
+    document: Dict[str, Any],
+    *,
+    evidence_id: str,
+    target: str,
+    target_url: str,
+    status_code: int,
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    history = list(document.get("handoff_history", []))
+    handoff_doc = {
+        "id": str(uuid.uuid4()),
+        "evidence_id": evidence_id,
+        "target": target,
+        "target_url": target_url,
+        "status_code": status_code,
+        "status": "succeeded" if status_code < 400 else "failed",
+        "created_at": iso_now(),
+    }
+    history.append(handoff_doc)
+    return history[-100:], handoff_doc
 
 
 def parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
@@ -527,6 +638,13 @@ async def create_evidence_record(doc_id: str, request: EvidencePackageRequest) -
     }
 
     await db.evidence_packages.insert_one(dict(evidence_record))
+    package_history, package_doc = append_package_history(
+        doc,
+        evidence_id=evidence_id,
+        version=version,
+        usecase_id=request.usecase_id,
+        package_hash=evidence_record["hash"],
+    )
     updated_audit_log = append_audit_event(
         doc,
         "evidence_package",
@@ -538,7 +656,14 @@ async def create_evidence_record(doc_id: str, request: EvidencePackageRequest) -
     )
     await db.documents.update_one(
         {"id": doc_id},
-        {"$set": {"audit_log": updated_audit_log}},
+        {
+            "$set": {
+                "audit_log": updated_audit_log,
+                "package_history": package_history,
+                "latest_package_id": package_doc["id"],
+                "current_state": "packaged",
+            }
+        },
     )
     evidence_record["document_audit_log"] = updated_audit_log
     return evidence_record
@@ -856,6 +981,7 @@ async def upload_document(
     # Generate unique filename
     doc_id = str(uuid.uuid4())
     new_filename = f"{doc_id}{file_ext}"
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     file_path = UPLOAD_DIR / new_filename
     
     # Save file
@@ -886,10 +1012,20 @@ async def upload_document(
     
     # Save to database
     doc_dict = doc.model_dump()
+    doc_dict["audit_log"] = append_audit_event(
+        doc_dict,
+        "upload",
+        {
+            "original_filename": file.filename,
+            "file_size": len(content),
+            "page_count": page_count,
+            "source_hash": doc_dict["source_hash"],
+        },
+    )
     doc_dict['uploaded_at'] = doc_dict['uploaded_at'].isoformat()
     await db.documents.insert_one(doc_dict)
     
-    return doc.model_dump()
+    return doc_dict
 
 @api_router.post("/documents/{doc_id}/categorize")
 async def categorize_document(
@@ -914,6 +1050,29 @@ async def categorize_document(
     # AI categorization
     classification = await ai_categorize_document(text)
     suggested_category = classification["category"]
+    review_required = classification.get("confidence", 0.0) < 0.75
+    processing_runs, run_doc = append_processing_run(
+        doc,
+        "classification",
+        triggered_by="categorize_endpoint",
+        status="completed",
+        details={
+            "category": suggested_category,
+            "document_type": classification.get("document_type"),
+            "confidence": classification.get("confidence"),
+        },
+    )
+    review_decisions = list(doc.get("review_decisions", []))
+    current_review_state = "classification_complete"
+    if review_required:
+        review_decisions, _ = append_review_decision(
+            doc,
+            run_id=run_doc["id"],
+            decision_type="escalate_to_hitl",
+            rationale="Classification confidence fell below the configured auto-accept threshold.",
+            resulting_state="awaiting_hitl",
+        )
+        current_review_state = "awaiting_hitl"
     
     # Check if it's academic
     is_academic = suggested_category == "Academic Papers" or "My Writings" in suggested_category
@@ -928,7 +1087,12 @@ async def categorize_document(
             "classification_confidence": classification.get("confidence"),
             "classification_rationale": classification.get("rationale"),
             "is_academic": is_academic,
-            "review_required": classification.get("confidence", 0.0) < 0.75,
+            "review_required": review_required,
+            "current_state": "classified",
+            "current_review_state": current_review_state,
+            "processing_runs": processing_runs,
+            "review_decisions": review_decisions,
+            "latest_run_id": run_doc["id"],
             "audit_log": append_audit_event(
                 doc,
                 "categorize",
@@ -982,6 +1146,29 @@ async def bulk_categorize_documents(
             suggested_category = classification["category"]
             is_academic = suggested_category == "Academic Papers" or "My Writings" in suggested_category
             review_required = classification.get("confidence", 0.0) < 0.75
+            processing_runs, run_doc = append_processing_run(
+                doc,
+                "classification",
+                triggered_by="bulk_categorize_endpoint",
+                status="completed",
+                details={
+                    "category": suggested_category,
+                    "document_type": classification.get("document_type"),
+                    "confidence": classification.get("confidence"),
+                    "bulk": True,
+                },
+            )
+            review_decisions = list(doc.get("review_decisions", []))
+            current_review_state = "classification_complete"
+            if review_required:
+                review_decisions, _ = append_review_decision(
+                    doc,
+                    run_id=run_doc["id"],
+                    decision_type="escalate_to_hitl",
+                    rationale="Bulk classification confidence fell below the configured auto-accept threshold.",
+                    resulting_state="awaiting_hitl",
+                )
+                current_review_state = "awaiting_hitl"
             
             await db.documents.update_one(
                 {"id": doc_id},
@@ -993,6 +1180,11 @@ async def bulk_categorize_documents(
                     "classification_rationale": classification.get("rationale"),
                     "is_academic": is_academic,
                     "review_required": review_required,
+                    "current_state": "classified",
+                    "current_review_state": current_review_state,
+                    "processing_runs": processing_runs,
+                    "review_decisions": review_decisions,
+                    "latest_run_id": run_doc["id"],
                     "audit_log": append_audit_event(
                         doc,
                         "bulk_categorize",
@@ -1038,12 +1230,22 @@ async def generate_summary(
         raise HTTPException(status_code=400, detail="No text content to summarize")
     
     summary = await ai_generate_summary(text)
+    processing_runs, run_doc = append_processing_run(
+        doc,
+        "summary",
+        triggered_by="summary_endpoint",
+        status="completed",
+        details={"summary_length": len(summary)},
+    )
     
     await db.documents.update_one(
         {"id": doc_id},
         {
             "$set": {
                 "summary": summary,
+                "current_state": "summarized",
+                "processing_runs": processing_runs,
+                "latest_run_id": run_doc["id"],
                 "audit_log": append_audit_event(doc, "summary", {"summary_length": len(summary)}),
             }
         }
@@ -1075,6 +1277,37 @@ async def extract_fields(
     fields = extraction.get("fields", {}) if isinstance(extraction.get("fields"), dict) else {}
     controls = run_control_checks(fields)
     review_required = bool(controls["missing_fields"] or controls["invalid_values"])
+    processing_runs, run_doc = append_processing_run(
+        doc,
+        "extraction",
+        triggered_by="extract_endpoint",
+        status="completed",
+        details={
+            "field_count": len(fields),
+            "missing_count": len(controls["missing_fields"]),
+            "invalid_count": len(controls["invalid_values"]),
+        },
+    )
+    review_decisions = list(doc.get("review_decisions", []))
+    current_review_state = "extraction_complete"
+    if review_required:
+        review_decisions, _ = append_review_decision(
+            doc,
+            run_id=run_doc["id"],
+            decision_type="escalate_to_hitl",
+            rationale="Control checks identified missing or invalid fields.",
+            resulting_state="awaiting_hitl",
+        )
+        current_review_state = "awaiting_hitl"
+    else:
+        review_decisions, _ = append_review_decision(
+            doc,
+            run_id=run_doc["id"],
+            decision_type="auto_accept",
+            rationale="Extraction passed configured control checks without requiring HITL.",
+            resulting_state="auto_approved",
+        )
+        current_review_state = "auto_approved"
 
     compliance_note = (
         "Contains potentially sensitive data; apply restricted access and masking where required."
@@ -1091,6 +1324,11 @@ async def extract_fields(
                 "control_checks": controls,
                 "review_required": review_required,
                 "compliance_note": compliance_note,
+                "current_state": "extracted",
+                "current_review_state": current_review_state,
+                "processing_runs": processing_runs,
+                "review_decisions": review_decisions,
+                "latest_run_id": run_doc["id"],
                 "audit_log": append_audit_event(
                     doc,
                     "extract",
@@ -1154,9 +1392,18 @@ async def handoff_to_compassai(
         headers={"Authorization": f"Bearer {COMPASSAI_INGEST_TOKEN}"},
     )
 
+    doc = await db.documents.find_one({"id": doc_id}, {"_id": 0}) or {}
+    handoff_history, handoff_doc = append_handoff_history(
+        doc,
+        evidence_id=evidence_record["id"],
+        target="compassai",
+        target_url=f"{target_base_url}/api/v1/evidence",
+        status_code=response["status_code"],
+    )
+
     await db.evidence_handoffs.insert_one(
         {
-            "id": str(uuid.uuid4()),
+            "id": handoff_doc["id"],
             "document_id": doc_id,
             "evidence_id": evidence_record["id"],
             "usecase_id": request.usecase_id,
@@ -1166,6 +1413,17 @@ async def handoff_to_compassai(
             "response": response["body"],
             "created_at": iso_now(),
         }
+    )
+
+    await db.documents.update_one(
+        {"id": doc_id},
+        {
+            "$set": {
+                "handoff_history": handoff_history,
+                "latest_handoff_id": handoff_doc["id"],
+                "current_state": "handed_off_to_compassai" if response["status_code"] < 400 else "handoff_failed",
+            }
+        },
     )
 
     if response["status_code"] >= 400:
@@ -1204,10 +1462,24 @@ async def extract_citations(
         raise HTTPException(status_code=400, detail="No text content to analyze")
     
     citations = await ai_extract_citations(text)
+    processing_runs, run_doc = append_processing_run(
+        doc,
+        "citation_extraction",
+        triggered_by="citation_endpoint",
+        status="completed",
+        details={"citation_count": len(citations)},
+    )
     
     await db.documents.update_one(
         {"id": doc_id},
-        {"$set": {"citations": citations}}
+        {
+            "$set": {
+                "citations": citations,
+                "current_state": "citations_extracted",
+                "processing_runs": processing_runs,
+                "latest_run_id": run_doc["id"],
+            }
+        }
     )
     
     return {"document_id": doc_id, "citations": citations}
